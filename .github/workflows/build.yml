@@ -73,7 +73,11 @@ jobs:
       - name: Apply SUSFS 1.5.3 Patches
         working-directory: common
         run: |
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git ../susfs4ksu
+          # Use GitHub mirror first to avoid GitLab 503 load errors
+          if ! git clone https://github.com/midori01/susfs4ksu.git ../susfs4ksu; then
+            echo "GitHub mirror failed, falling back to GitLab..."
+            git clone https://gitlab.com/simonpunk/susfs4ksu.git ../susfs4ksu
+          fi
           cd ../susfs4ksu
           git checkout ${{ inputs.susfs_commit }}
           cd ../common
@@ -82,7 +86,7 @@ jobs:
           cp -f ../susfs4ksu/kernel_patches/include/linux/* include/linux/
 
           if [ -f "../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android14-6.1.patch" ]; then
-            patch -p1 -ui < ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android14-6.1.patch || true
+            patch -p1 --forward -i ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android14-6.1.patch || true
           fi
 
           echo "Checking SUSFS version in tree:"
@@ -146,8 +150,8 @@ jobs:
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel
           cd anykernel
           sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
-          sed -i 's/is_slot_device=0/is_slot_device=1/g' anykernel.sh
-          sed -i 's/block=auto/block=\/dev\/block\/bootdevice\/by-name\/boot/g' anykernel.sh
+          sed -i 's/IS_SLOT_DEVICE=.*/IS_SLOT_DEVICE=1;/g' anykernel.sh
+          sed -i 's/BLOCK=.*/BLOCK=boot;/g' anykernel.sh
 
           cp "../$IMAGE" ./Image
           ZIP_NAME="AnyKernel3-Xiaomi14-houji-KernelSU-Next-SUSFS-1.5.3.zip"
