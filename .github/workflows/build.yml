@@ -1,0 +1,165 @@
+name: Build Xiaomi 14 GKI Kernel (KernelSU-Next + SUSFS 1.5.3)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ack_branch:
+        description: 'ACK 源码分支 (默认推荐 2024-05，防屏幕闪烁)'
+        required: true
+        default: 'deprecated/android14-6.1-2024-05'
+        type: choice
+        options:
+          - 'deprecated/android14-6.1-2024-05'
+          - 'android14-6.1-lts'
+          - 'deprecated/android14-6.1-2024-04'
+      ksu_branch:
+        description: 'KernelSU-Next 分支 (next-susfs 专为 SUSFS 定制)'
+        required: true
+        default: 'next-susfs'
+      susfs_commit:
+        description: 'SUSFS 提交哈希 (锁定 1.5.3 稳定提交)'
+        required: true
+        default: 'bc5bb8cc92f8a90ce6b0601e2312975293900dca'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Xiaomi 14 GKI Kernel
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Free Disk Space & Install Dependencies
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl flex git libelf-dev libssl-dev lz4 make \
+            python3 python-is-python3 rsync zip unzip aria2 tar gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+
+      - name: Setup Ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: houji-gki-6.1-ksun-susfs153
+          max-size: 8G
+
+      - name: Download AOSP Clang (r487747c)
+        run: |
+          mkdir -p clang
+          CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main-kernel-build-2023/clang-r487747c.tar.gz"
+          aria2c -s16 -x16 -k1M "$CLANG_URL" -o clang.tar.gz
+          tar -xzf clang.tar.gz -C clang
+          rm -f clang.tar.gz
+
+      - name: Fetch ACK Kernel Source
+        run: |
+          mkdir -p common
+          echo "Fetching branch: ${{ inputs.ack_branch }}"
+          KERNEL_URL="https://android.googlesource.com/kernel/common/+archive/refs/heads/${{ inputs.ack_branch }}.tar.gz"
+          aria2c -s16 -x16 -k1M "$KERNEL_URL" -o common.tar.gz
+          tar -xzf common.tar.gz -C common
+          rm -f common.tar.gz
+
+      - name: Setup KernelSU-Next
+        working-directory: common
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/${{ inputs.ksu_branch }}/kernel/setup.sh" | bash -s ${{ inputs.ksu_branch }}
+
+      - name: Apply SUSFS 1.5.3 Patches
+        working-directory: common
+        run: |
+          git clone https://gitlab.com/simonpunk/susfs4ksu.git ../susfs4ksu
+          cd ../susfs4ksu
+          git checkout ${{ inputs.susfs_commit }}
+          cd ../common
+
+          cp -f ../susfs4ksu/kernel_patches/fs/* fs/
+          cp -f ../susfs4ksu/kernel_patches/include/linux/* include/linux/
+
+          if [ -f "../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android14-6.1.patch" ]; then
+            patch -p1 -ui < ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-android14-6.1.patch || true
+          fi
+
+          echo "Checking SUSFS version in tree:"
+          grep "SUSFS_VERSION" include/linux/susfs.h
+
+      - name: Fix Xiaomi / GKI Protected Exports & Setlocalversion
+        working-directory: common
+        run: |
+          rm -f android/abi_gki_protected_exports_* || true
+          sed -i 's/ -dirty//g' scripts/setlocalversion || true
+
+      - name: Configure GKI Defconfig
+        working-directory: common
+        run: |
+          DEFCONFIG="arch/arm64/configs/gki_defconfig"
+          cat >> "$DEFCONFIG" << 'EOF'
+          CONFIG_KSU=y
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_HAVE_SYSCALL_TRACEPOINTS=y
+          CONFIG_OVERLAY_FS=y
+
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_SU=n
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          EOF
+
+      - name: Compile Kernel
+        working-directory: common
+        run: |
+          export PATH="${{ github.workspace }}/clang/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export LLVM=1
+          export LLVM_IAS=1
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          make -j$(nproc) O=out gki_defconfig
+          make -j$(nproc) O=out Image
+
+      - name: Package with AnyKernel3
+        run: |
+          IMAGE="common/out/arch/arm64/boot/Image"
+          if [ ! -f "$IMAGE" ]; then
+            echo "Kernel Image was not generated!"
+            exit 1
+          fi
+
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel
+          cd anykernel
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
+          sed -i 's/is_slot_device=0/is_slot_device=1/g' anykernel.sh
+          sed -i 's/block=auto/block=\/dev\/block\/bootdevice\/by-name\/boot/g' anykernel.sh
+
+          cp "../$IMAGE" ./Image
+          ZIP_NAME="AnyKernel3-Xiaomi14-houji-KernelSU-Next-SUSFS-1.5.3.zip"
+          zip -r9 "../$ZIP_NAME" * -x "*.git*" "README.md"
+          cd ..
+          cp "$IMAGE" ./Image-houji-ksun-susfs153
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Xiaomi14-houji-KernelSU-Next-SUSFS-1.5.3
+          path: |
+            AnyKernel3-Xiaomi14-houji-KernelSU-Next-SUSFS-1.5.3.zip
+            Image-houji-ksun-susfs153
+          retention-days: 7
