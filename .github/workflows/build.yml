@@ -92,11 +92,14 @@ jobs:
           echo "Checking SUSFS version in tree:"
           grep "SUSFS_VERSION" include/linux/susfs.h
 
-      - name: Fix Xiaomi / GKI Protected Exports & Setlocalversion
+      - name: Fix Xiaomi / GKI Protected Exports & Clang Compatibility
         working-directory: common
         run: |
           rm -f android/abi_gki_protected_exports_* || true
           sed -i 's/ -dirty//g' scripts/setlocalversion || true
+          # Fix libbpf compatibility with Clang 17 host compiler
+          find tools/ -type f \( -name "Makefile*" -o -name "*.mk" \) -exec sed -i 's/-Werror//g' {} + || true
+          sed -i 's/char \*next_path;/const char \*next_path;/g' tools/lib/bpf/libbpf.c || true
 
       - name: Configure GKI Defconfig
         working-directory: common
